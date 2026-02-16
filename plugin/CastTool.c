@@ -26,7 +26,7 @@ uint64_t global_expensive = 0;
 uint64_t global_long = 0;
 uint64_t global_chains = 0;
 
-#define RISCV_OPCODE(inst) (inst & 0x7F)
+/* RISC-V Field Extraction Macros */
 #define GET_RD(inst)       ((inst >> 7) & 0x1F)
 #define GET_RS1(inst)      ((inst >> 15) & 0x1F)
 #define GET_RS2(inst)      ((inst >> 20) & 0x1F)
@@ -44,59 +44,69 @@ int lej_pre_thread_handler(mambo_context *ctx) {
     data->chain_count = 0;
     data->in_roi = false;
 
-    mambo_set_thread_plugin_data(ctx, data);
+    int ret = mambo_set_thread_plugin_data(ctx, data);
+    assert(ret == MAMBO_SUCCESS);
     return 0;
 }
 
 int lej_pre_inst_handler(mambo_context *ctx) {
     struct lej_thread_data *data = mambo_get_thread_plugin_data(ctx);
     uint32_t inst = mambo_get_inst(ctx);
-    uintptr_t pc = (uintptr_t)mambo_get_inst_addr(ctx);
+    
+    /* HATA DÜZELTME: mtrace.c'de olduğu gibi mambo_get_source_addr kullanıyoruz */
+    uintptr_t pc = (uintptr_t)mambo_get_source_addr(ctx);
 
     if (inst == 0x00100013) { data->in_roi = true; return 0; }
     if (inst == 0x00200013) { data->in_roi = false; return 0; }
     if (!data->in_roi) return 0;
 
-    uint32_t op = RISCV_OPCODE(inst);
-    uint32_t f3 = (inst >> 12) & 0x7;
-    uint32_t f7 = (inst >> 25) & 0x7F;
+    /* MAMBO API helper fonksiyonlarını kullanıyoruz */
+    bool is_load = mambo_is_load(ctx);
+    bool is_store = mambo_is_store(ctx);
+
     int rs1 = GET_RS1(inst);
     int rs2 = GET_RS2(inst);
     int rd  = GET_RD(inst);
 
+    /* 1. Consumer Analizi */
     if (rs1 != 0 && rs2 != 0) {
         if ((data->reg_file[rs1] == REG_PENDING_EXPENSIVE && data->reg_file[rs2] == REG_PENDING_LONG) ||
             (data->reg_file[rs1] == REG_PENDING_LONG && data->reg_file[rs2] == REG_PENDING_EXPENSIVE)) {
             
             data->chain_count++;
             if (chain_file) {
-                fprintf(chain_file, "INDEPENDENT_STALL [PC: 0x%" PRIxPTR "]: RS1_PC:0x%" PRIxPTR " RS2_PC:0x%" PRIxPTR "\n",
+                fprintf(chain_file, "STALL_FOUND [PC: 0x%" PRIxPTR "]: Producer1_PC:0x%" PRIxPTR " Producer2_PC:0x%" PRIxPTR "\n",
                         pc, data->last_producer_pc[rs1], data->last_producer_pc[rs2]);
             }
         }
     }
 
+    /* 2. Producer Analizi */
     if (rd != 0) {
-        if ((op == 0x33 || op == 0x3B) && f7 == 0x01) { 
+        uint32_t op = inst & 0x7F;
+        uint32_t f7 = (inst >> 25) & 0x7F;
+
+        if ((op == 0x33 || op == 0x3B) && f7 == 0x01) { /* MUL/DIV */
             if (data->reg_file[rs1] != REG_PENDING_LONG && data->reg_file[rs2] != REG_PENDING_LONG) {
                 data->expensive_count++;
                 data->reg_file[rd] = REG_PENDING_EXPENSIVE;
                 data->last_producer_pc[rd] = pc;
             }
-        } else if (op == 0x03) { 
+        } else if (is_load) { /* mambo_is_load() kullanımı */
             if (data->reg_file[rs1] != REG_PENDING_EXPENSIVE) {
                 data->long_count++;
                 data->reg_file[rd] = REG_PENDING_LONG;
                 data->last_producer_pc[rd] = pc;
             }
-        } else if (op == 0x23) { 
-             if (data->reg_file[rs1] != REG_PENDING_EXPENSIVE && data->reg_file[rs2] != REG_PENDING_EXPENSIVE) {
-                data->long_count++;
-             }
-        } else if (op != 0x63) { 
+        } else {
             data->reg_file[rd] = REG_CLEAN;
         }
+    } else if (is_store) { /* mambo_is_store() kullanımı */
+         if (data->reg_file[rs1] != REG_PENDING_EXPENSIVE && data->reg_file[rs2] != REG_PENDING_EXPENSIVE) {
+            data->long_count++;
+         }
     }
+
     return 0;
 }
 
